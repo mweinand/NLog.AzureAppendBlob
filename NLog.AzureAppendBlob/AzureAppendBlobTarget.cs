@@ -6,11 +6,13 @@ using NLog.Config;
 using NLog.Layouts;
 using NLog.Targets;
 using NLog.Common;
+using System.IO;
+using System;
 
 namespace NLog.AzureAppendBlob
 {
 	[Target("AzureAppendBlob")]
-	public sealed class AzureAppendBlobTarget: TargetWithLayout
+	public sealed class AzureAppendBlobTarget : TargetWithLayout
 	{
 		[RequiredParameter]
 		public Layout ConnectionString { get; set; }
@@ -26,6 +28,8 @@ namespace NLog.AzureAppendBlob
 		private CloudAppendBlob _blob;
 		private string _connectionString;
 
+		private const string NewLine = "\r\n";
+
 		protected override void InitializeTarget()
 		{
 			base.InitializeTarget();
@@ -33,7 +37,59 @@ namespace NLog.AzureAppendBlob
 			_client = null;
 		}
 
+		protected override void Write(AsyncLogEventInfo[] logEvents)
+		{
+			if (logEvents.Length == 0)
+			{
+				return;
+			}
+
+			ConnectToBlob(logEvents[0].LogEvent);
+
+			try
+			{
+				using (var stream = new MemoryStream())
+				using (var writer = new StreamWriter(stream))
+				{
+					for (int i = 0; i < logEvents.Length; ++i)
+					{
+						this.MergeEventProperties(logEvents[i].LogEvent);
+						writer.WriteLine(Layout.Render(logEvents[i].LogEvent));
+					}
+
+					writer.Flush();
+
+					stream.Seek(0, SeekOrigin.Begin);
+					_blob.AppendBlock(stream);
+				}
+
+				for (int i = 0; i < logEvents.Length; ++i)
+				{
+					logEvents[i].Continuation(null);
+				}
+			}
+			catch (Exception exception)
+			{
+				for (int i = 0; i < logEvents.Length; ++i)
+				{
+					logEvents[i].Continuation(exception);
+				}
+			}
+		}
+
+		protected override void Write(AsyncLogEventInfo logEvent)
+		{
+			// just flow through and use base functionality, forward call to Write(LogEventInfo)
+			base.Write(logEvent);
+		}
+
 		protected override void Write(LogEventInfo logEvent)
+		{
+			ConnectToBlob(logEvent);
+			_blob.AppendText(Layout.Render(logEvent) + NewLine, Encoding.UTF8);
+		}
+		
+		private void ConnectToBlob(LogEventInfo logEvent)
 		{
 			var connectionString = ConnectionString.Render(logEvent);
 
@@ -41,6 +97,8 @@ namespace NLog.AzureAppendBlob
 			{
 				_client = CloudStorageAccount.Parse(connectionString).CreateCloudBlobClient();
 				InternalLogger.Debug("Initialized connection to {0}", connectionString);
+				_connectionString = connectionString;
+
 			}
 
 			string containerName = Container.Render(logEvent);
@@ -51,7 +109,7 @@ namespace NLog.AzureAppendBlob
 				_container = _client.GetContainerReference(containerName);
 				InternalLogger.Debug("Got container reference to {0}", containerName);
 
-				if(_container.CreateIfNotExists())
+				if (_container.CreateIfNotExists())
 				{
 					InternalLogger.Debug("Created container {0}", containerName);
 				}
@@ -71,14 +129,12 @@ namespace NLog.AzureAppendBlob
 						_blob.CreateOrReplace(AccessCondition.GenerateIfNotExistsCondition());
 						InternalLogger.Debug("Created blob: {0}", blobName);
 					}
-					catch (StorageException ex) when (ex.RequestInformation.HttpStatusCode == (int) HttpStatusCode.Conflict)
+					catch (StorageException ex) when (ex.RequestInformation.HttpStatusCode == (int)HttpStatusCode.Conflict)
 					{
 						// to be expected
 					}
 				}
 			}
-
-			_blob.AppendText(Layout.Render(logEvent) + "\r\n", Encoding.UTF8);
 		}
 	}
 }
